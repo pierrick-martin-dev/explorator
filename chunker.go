@@ -1,137 +1,303 @@
 package main
 
 import (
-	"bufio"
-	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 )
 
-// Config holds the application settings
-type Config struct {
-	SrcDir        string
-	OutDir        string
-	MaxChunkSize  int
-	StripComments bool
+// WorkUnit represents a collection of file paths to be bundled into one chunk.
+type WorkUnit []string
+
+type Chunker struct {
+	extsToKeep map[string]struct{}
+	limitChunk uint
 }
 
-// Processor handles the state of the current ingestion run
-type Processor struct {
-	cfg          *Config
-	chunkID      int
-	currentFiles []FileData
-	currentSize  int
-	singleLineRE *regexp.Regexp
-	multiLineRE  *regexp.Regexp
-}
-
-type FileData struct {
-	Path    string
-	Content string
-}
-
-func NewProcessor(cfg *Config) *Processor {
-	return &Processor{
-		cfg:          cfg,
-		chunkID:      1,
-		singleLineRE: regexp.MustCompile(`//.*`),
-		multiLineRE:  regexp.MustCompile(`(?s)/\*.*?\*/`),
+func NewChunker(extsToKeep []string, limitChunk uint) *Chunker {
+	extMap := make(map[string]struct{})
+	for _, ext := range extsToKeep {
+		extMap[strings.ToLower(ext)] = struct{}{}
+	}
+	return &Chunker{
+		extsToKeep: extMap,
+		limitChunk: limitChunk,
 	}
 }
 
-func (p *Processor) stripCode(content string) string {
-	if !p.cfg.StripComments {
-		return content
-	}
-	content = p.multiLineRE.ReplaceAllString(content, "")
-	content = p.singleLineRE.ReplaceAllString(content, "")
-
-	lines := strings.Split(content, "\n")
-	var cleanLines []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed != "" {
-			cleanLines = append(cleanLines, trimmed)
-		}
-	}
-	return strings.Join(cleanLines, "\n")
+// Node represents a directory or file metadata
+type Node struct {
+	Name     string
+	Path     string
+	IsDir    bool
+	Size     int64
+	Children []Node
 }
 
-func (p *Processor) writeChunk() error {
-	fileName := filepath.Join(p.cfg.OutDir, fmt.Sprintf("chunk_%d.txt", p.chunkID))
-	f, err := os.Create(fileName)
+func (c *Chunker) Chunk(src string, dest string) error {
+	tree, err := c.harvestStatTree(src)
 	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	writer := bufio.NewWriter(f)
-
-	writer.WriteString("### PROJECT HIERARCHY (CHUNK CONTEXT) ###\n")
-	for _, file := range p.currentFiles {
-		writer.WriteString(fmt.Sprintf("- %s\n", file.Path))
-	}
-	writer.WriteString("\n" + strings.Repeat("=", 64) + "\n\n")
-
-	for _, file := range p.currentFiles {
-		writer.WriteString(fmt.Sprintf("--- SOURCE: %s ---\n", file.Path))
-		writer.WriteString(file.Content)
-		writer.WriteString("\n\n")
+		return fmt.Errorf("harvest failed: %w", err)
 	}
 
-	return writer.Flush()
-}
-
-func (p *Processor) Run(_ context.Context) error {
-	fmt.Printf("🚀 Starting Auto-Ingest\nSource: %s\nLimit: %d bytes\n\n", p.cfg.SrcDir, p.cfg.MaxChunkSize)
-
-	if err := os.MkdirAll(p.cfg.OutDir, 0755); err != nil {
-		return fmt.Errorf("could not create output directory: %w", err)
-	}
-
-	err := filepath.Walk(p.cfg.SrcDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		ext := strings.ToLower(filepath.Ext(path))
-		if info.IsDir() || !(ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".pc" || ext == ".ec" || ext == ".cat") {
-			return nil
-		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-
-		processed := p.stripCode(string(data))
-		entrySize := len(processed) + len(path) + 100
-
-		if p.currentSize+entrySize > p.cfg.MaxChunkSize && len(p.currentFiles) > 0 {
-			fmt.Printf("📦 Chunk %d...\n", p.chunkID)
-			if err := p.writeChunk(); err != nil {
-				return err
-			}
-			p.chunkID++
-			p.currentFiles = nil
-			p.currentSize = 0
-		}
-
-		p.currentFiles = append(p.currentFiles, FileData{Path: path, Content: processed})
-		p.currentSize += entrySize
-		return nil
-	})
-
+	works, err := c.partitionWork(*tree)
 	if err != nil {
+		return fmt.Errorf("partition failed: %w", err)
+	}
+
+	if err := os.MkdirAll(dest, fs.ModePerm); err != nil {
 		return err
 	}
 
-	if len(p.currentFiles) > 0 {
-		return p.writeChunk()
+	if err := c.Validate(src, works); err != nil {
+		return fmt.Errorf("c.Validate(): %w", err)
 	}
+
+	for i, w := range works {
+		if err := c.processChunkWork(w, src, dest, i+1); err != nil {
+			return fmt.Errorf("processing failed for chunk %d: %w", i, err)
+		}
+	}
+
+	fmt.Printf("📦 Processed %d chunks\n", len(works))
 
 	return nil
+}
+
+func (c *Chunker) harvestStatTree(path string) (*Node, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	node := &Node{
+		Name:  info.Name(),
+		Path:  path,
+		IsDir: info.IsDir(),
+	}
+
+	if !info.IsDir() {
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, ok := c.extsToKeep[ext]; !ok {
+			return nil, nil
+		}
+		node.Size = info.Size()
+		return node, nil
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		child, err := c.harvestStatTree(filepath.Join(path, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+
+		if child == nil {
+			continue
+		}
+
+		node.Children = append(node.Children, *child)
+		node.Size += child.Size
+	}
+
+	return node, nil
+}
+
+func (c *Chunker) partitionWork(tree Node) ([]WorkUnit, error) {
+	var works []WorkUnit
+
+	if uint(tree.Size) <= c.limitChunk {
+		files := c.collectFiles(tree)
+
+		if len(files) > 0 {
+			return []WorkUnit{files}, nil
+		}
+		return nil, nil
+	}
+
+	var localFiles []Node
+	for _, child := range tree.Children {
+		if child.IsDir {
+			childWorks, _ := c.partitionWork(child)
+
+			if len(childWorks) > 0 {
+				works = append(works, childWorks...)
+			}
+		} else {
+
+			if child.Path != "" {
+				localFiles = append(localFiles, child)
+			}
+		}
+	}
+
+	if len(localFiles) > 0 {
+		residuals := c.splitLinearly(localFiles)
+		for _, r := range residuals {
+			if len(r) > 0 {
+				works = append(works, r)
+			}
+		}
+	}
+
+	return works, nil
+}
+
+func (c *Chunker) collectFiles(n Node) WorkUnit {
+	if !n.IsDir {
+		return WorkUnit{n.Path}
+	}
+	var res WorkUnit
+	for _, child := range n.Children {
+		res = append(res, c.collectFiles(child)...)
+	}
+	return res
+}
+
+func (c *Chunker) splitLinearly(nodes []Node) []WorkUnit {
+	var results []WorkUnit
+	var current WorkUnit
+	var currentSize uint
+
+	for _, n := range nodes {
+		size := uint(n.Size)
+
+		if currentSize+size > c.limitChunk && len(current) > 0 {
+			results = append(results, current)
+			current = WorkUnit{}
+			currentSize = 0
+		}
+		current = append(current, n.Path)
+		currentSize += size
+	}
+	if len(current) > 0 {
+		results = append(results, current)
+	}
+	return results
+}
+
+func (c *Chunker) Validate(src string, works []WorkUnit) error {
+	expectedFiles := make(map[string]bool)
+	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, ok := c.extsToKeep[ext]; ok {
+			expectedFiles[path] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	actualFiles := make(map[string]int)
+	for _, unit := range works {
+		for _, path := range unit {
+			actualFiles[path]++
+		}
+	}
+
+	fmt.Printf("\n--- 🛡️ Validation Report ---\n")
+	fmt.Printf("Files on disk (matching exts): %d\n", len(expectedFiles))
+	fmt.Printf("Files assigned to chunks:    %d\n", len(actualFiles))
+
+	missing := 0
+	for path := range expectedFiles {
+		if actualFiles[path] == 0 {
+			fmt.Printf("❌ MISSING: %s\n", path)
+			missing++
+		}
+	}
+
+	duplicates := 0
+	for path, count := range actualFiles {
+		if count > 1 {
+			fmt.Printf("⚠️ DUPLICATE (%d times): %s\n", count, path)
+			duplicates++
+		}
+	}
+
+	if missing == 0 && duplicates == 0 {
+		fmt.Println("✅ 100% integrity: Every file is accounted for exactly once.")
+		return nil
+	}
+
+	return fmt.Errorf("integrity check failed: %d missing, %d duplicates", missing, duplicates)
+}
+
+func (c *Chunker) processChunkWork(work WorkUnit, srcDir, destDir string, chunkID int) error {
+	if len(work) == 0 {
+		return nil
+	}
+
+	chunkPath := filepath.Join(destDir, fmt.Sprintf("chunk_%d.txt", chunkID))
+
+	var chunkContent strings.Builder
+
+	chunkContent.WriteString("<directory_structure>\n")
+	for _, p := range work {
+		cleanedPath, err := filepath.Rel(srcDir, p)
+		if err != nil {
+			return fmt.Errorf("filepath.Rel(%q): %w", p, err)
+		}
+
+		fmt.Fprintf(&chunkContent, "- %s\n", cleanedPath)
+	}
+	chunkContent.WriteString("</directory_structure>\n\n")
+
+	chunkContent.WriteString("<files>\n")
+	for _, p := range work {
+		content, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("read %q: %w", p, err)
+		}
+
+		cleaned := cleanContent(string(content))
+		cleanedPath, err := filepath.Rel(srcDir, p)
+		if err != nil {
+			return fmt.Errorf("filepath.Rel(%q): %w", p, err)
+		}
+
+		chunkContent.WriteString(fmt.Sprintf("<file path=%q>\n", cleanedPath))
+		chunkContent.WriteString(cleaned)
+		chunkContent.WriteString("\n</file>\n\n")
+	}
+	chunkContent.WriteString("</files>")
+
+	return os.WriteFile(chunkPath, []byte(chunkContent.String()), 0644)
+}
+
+var (
+	singleLineRE = regexp.MustCompile(`//.*`)
+	multiLineRE  = regexp.MustCompile(`(?s)/\*.*?\*/`)
+)
+
+func cleanContent(content string) string {
+	content = multiLineRE.ReplaceAllString(content, "")
+
+	content = singleLineRE.ReplaceAllString(content, "")
+
+	lines := strings.Split(content, "\n")
+	var cleaned []string
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "" {
+			continue
+		}
+
+		cleaned = append(cleaned, trimmed)
+	}
+
+	return strings.Join(cleaned, "\n")
 }
