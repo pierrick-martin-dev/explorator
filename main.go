@@ -18,28 +18,41 @@ func main() {
 
 	switch strings.ToLower(command) {
 	case "chunker":
-		cfg := &Config{}
+		fs := flag.NewFlagSet("chunker", flag.ExitOnError)
 
-		flag.StringVar(&cfg.SrcDir, "src", "./", "Source directory of the codebase")
-		flag.StringVar(&cfg.OutDir, "out", "./stark_chunks", "Output directory for chunks")
-		flag.IntVar(&cfg.MaxChunkSize, "limit", 1500000, "Max size of each chunk in bytes (~500k tokens)")
-		flag.BoolVar(&cfg.StripComments, "strip", true, "Whether to strip C-style comments")
-		flag.Parse()
+		srcDir := fs.String("src", "./", "Source directory")
+		outDir := fs.String("out", "./staging", "Output directory")
+		limit := fs.Uint("limit", 1500000, "Max size in bytes")
 
-		proc := NewProcessor(cfg)
-		if err := proc.Run(ctx); err != nil {
-			log.Fatalf("proc.Run(): %s", err)
+		fs.Parse(os.Args[2:])
+
+		fmt.Printf("Chunking %q into %q with %d limit\n", *srcDir, *outDir, *limit)
+
+		chunker := NewChunker([]string{
+			// from `tokei -l`
+			".cc", ".cpp", ".cxx", ".c++", ".pcc", ".tpp", // c++
+			".hh", ".hpp", ".hxx", ".inl", ".ipp", // c++ header
+			".cppm", ".ixx", ".ccm", ".mpp", ".mxx", ".cxxm", ".hppm", ".hxxm", // c++ module
+			".c", ".ec", ".pgc", // c
+			".h",    // c header
+			".csh",  // c shell
+			".java", // java
+			".cat",  // Rational Rose
+		}, *limit)
+		if err := chunker.Chunk(*srcDir, *outDir); err != nil {
+			log.Fatalf("chunker.Run(): %s", err)
 		}
-		fmt.Printf("\n✅ Ingestion complete. Chunks generated in %s\n", cfg.OutDir)
 
 	case "briefer":
 		projectID := getEnvStrOr("PROJECT_ID", "my-project")
 		location := getEnvStrOr("LOCATION", "global")
-		dir := ""
-		output := ""
-		flag.StringVar(&dir, "dir", "./stark_chunks", "Chunks directory")
-		flag.StringVar(&output, "output", "database.json", "Where briefs are written")
-		flag.Parse()
+
+		fs := flag.NewFlagSet("briefer", flag.ExitOnError)
+
+		dir := fs.String("dir", "./staging", "Chunks directory")
+		output := fs.String("output", "database.json", "Output file")
+
+		fs.Parse(os.Args[2:])
 
 		client, err := genai.NewClient(ctx, &genai.ClientConfig{
 			Project:  projectID,
@@ -50,8 +63,8 @@ func main() {
 			log.Fatalf("genai.NewClient(): %s", err)
 		}
 
-		if err := GenerateBriefsFromChunks(ctx, client, dir, output); err != nil {
-			log.Fatalf("GenerateBriefsFromChunks(%q): %s", dir, err)
+		if err := GenerateBriefsFromChunks(ctx, client, *dir, *output); err != nil {
+			log.Fatalf("GenerateBriefsFromChunks(%s): %s", *dir, err)
 		}
 
 	default:
