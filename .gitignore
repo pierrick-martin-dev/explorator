@@ -33,3 +33,5 @@ go.work.sum
 
 staging/
 .direnv
+database.json
+database/
