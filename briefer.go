@@ -40,14 +40,9 @@ File to analyze: %s
 type Brief = json.RawMessage
 
 func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir string, output string) error {
-	briefs := []Brief{}
 
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
-			return nil
-		}
-
-		if d.Name() != "chunk_1.txt" {
 			return nil
 		}
 
@@ -55,28 +50,34 @@ func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir str
 			return nil
 		}
 
-		bs, err := BriefChunkWithCache(ctx, client, filepath.Join(dir, d.Name()))
+		base := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
+		outputPath := filepath.Join(output, base+".json")
+		if _, err := os.Stat(outputPath); err == nil {
+			fmt.Printf("Ignore %q, already done\n", outputPath)
+
+			return nil
+		}
+
+		briefs, err := BriefChunkWithCache(ctx, client, filepath.Join(dir, d.Name()))
 		if err != nil {
 			return fmt.Errorf("BriefChunkWithCache(%q): %w", d.Name(), err)
 		}
 
-		briefs = append(briefs, bs...)
+		save, err := json.Marshal(briefs)
+		if err != nil {
+			os.WriteFile("failed.json", fmt.Appendf(nil, "%s", briefs), os.ModePerm)
 
-		return nil
+			return fmt.Errorf("json.Marshal(): %w", err)
+		}
+
+		return os.WriteFile(outputPath, save, os.ModePerm)
 	})
 
 	if err != nil {
 		return fmt.Errorf("filepath.WalkDir(%q): %w", dir, err)
 	}
 
-	save, err := json.Marshal(briefs)
-	if err != nil {
-		os.WriteFile("failed.json", []byte(fmt.Sprintf("%s", briefs)), os.ModePerm)
-
-		return fmt.Errorf("json.Marshal(): %w", err)
-	}
-
-	return os.WriteFile(output, save, os.ModePerm)
+	return nil
 }
 
 func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunkPath string) ([]Brief, error) {
@@ -89,6 +90,10 @@ func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunkPath st
 	filePaths, err := extractFilePathsFromChunk(chunkData)
 	if err != nil {
 		return nil, fmt.Errorf("extractFilePathsFromChunk(): %w", err)
+	}
+
+	if len(chunkData) < 1024 {
+		return BriefChunkWithoutCache(ctx, client, string(chunkData), filePaths)
 	}
 
 	cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
@@ -107,24 +112,21 @@ func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunkPath st
 		}
 
 		start := time.Now()
-		resp, err := client.Models.GenerateContent(
-			ctx,
-			model,
-			genai.Text(fmt.Sprintf(prompt, path)),
-			&genai.GenerateContentConfig{CachedContent: cache.Name, ResponseMIMEType: "application/json"},
-		)
+		resp, err := requestAnalyseWithCache(ctx, client, path, cache)
 		if err != nil {
 			if strings.Contains(err.Error(), "429") {
 				time.Sleep(10 * time.Second)
-				resp, err = client.Models.GenerateContent(ctx, model, genai.Text(fmt.Sprintf(
-					"Based on the cached code, give me a JSON summary for ONLY the file: %s, object MUST be { summary: string}", path,
-				)), &genai.GenerateContentConfig{CachedContent: cache.Name})
+				resp, err = requestAnalyseWithCache(ctx, client, path, cache)
 			} else {
 				return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 			}
 		}
+		content, err := extractContentFromResponse(resp)
+		if err != nil {
+			return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
+		}
 
-		briefs = append(briefs, []byte(resp.Candidates[0].Content.Parts[0].Text))
+		briefs = append(briefs, content)
 
 		fmt.Printf("Brief done for %q in %s (%d/%d)\n", path, time.Since(start), i+1, len(filePaths))
 	}
@@ -132,8 +134,125 @@ func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunkPath st
 	return briefs, nil
 }
 
-func extractContentFromResponse(resp *genai.GenerateContentResponse) (string, error) {
-	return "", nil
+func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path string, cache *genai.CachedContent) (*genai.GenerateContentResponse, error) {
+	return client.Models.GenerateContent(
+		ctx,
+		model,
+		genai.Text(fmt.Sprintf(prompt, path)),
+		&genai.GenerateContentConfig{
+			CachedContent:    cache.Name,
+			ResponseMIMEType: "application/json",
+			ResponseSchema:   analyseSchema(),
+		},
+	)
+}
+
+func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunkData string, files []string) ([]Brief, error) {
+	briefs := []Brief{}
+
+	for i, path := range files {
+		if i > 10 {
+			break
+		}
+
+		start := time.Now()
+		resp, err := requestAnalyseWithoutCache(ctx, client, path, chunkData)
+		if err != nil {
+			if strings.Contains(err.Error(), "429") {
+				time.Sleep(10 * time.Second)
+				resp, err = requestAnalyseWithoutCache(ctx, client, path, chunkData)
+			} else {
+				return nil, fmt.Errorf("model.GenerateContent(): %w", err)
+			}
+		}
+		content, err := extractContentFromResponse(resp)
+		if err != nil {
+			return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
+		}
+
+		briefs = append(briefs, content)
+
+		fmt.Printf("Brief done for %q in %s (%d/%d)\n", path, time.Since(start), i+1, len(files))
+	}
+
+	return briefs, nil
+}
+
+func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path string, chunkData string) (*genai.GenerateContentResponse, error) {
+	return client.Models.GenerateContent(
+		ctx,
+		model,
+		genai.Text(fmt.Sprintf("File: %s\n", chunkData)+fmt.Sprintf(prompt, path)),
+		&genai.GenerateContentConfig{
+			ResponseMIMEType: "application/json",
+			ResponseSchema:   analyseSchema(),
+		},
+	)
+}
+
+func analyseSchema() *genai.Schema {
+	return &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"file_path": {Type: genai.TypeString},
+			"type":      {Type: genai.TypeString, Enum: []string{"header", "implementation", "resource", "other"}},
+			"summary":   {Type: genai.TypeString},
+			"entities": {
+				Type: genai.TypeArray,
+				Items: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"name":        {Type: genai.TypeString},
+						"kind":        {Type: genai.TypeString, Enum: []string{"class", "struct", "function"}},
+						"description": {Type: genai.TypeString},
+					},
+				},
+			},
+			"dependencies": {
+				Type:  genai.TypeArray,
+				Items: &genai.Schema{Type: genai.TypeString},
+			},
+			"legacy_markers": {
+				Type: genai.TypeObject,
+				Properties: map[string]*genai.Schema{
+					"uses_open_utm": {Type: genai.TypeBoolean},
+					"uses_psdb":     {Type: genai.TypeBoolean},
+					"frameworks": {
+						Type:  genai.TypeArray,
+						Items: &genai.Schema{Type: genai.TypeString},
+					},
+				},
+			},
+		},
+		Required: []string{"file_path", "type", "summary", "entities", "legacy_markers"},
+	}
+}
+
+var (
+	ErrNoCandidate         = fmt.Errorf("no candidate")
+	ErrNoPartsForCandidate = fmt.Errorf("no parts for first candidate")
+	ErrNoContent           = fmt.Errorf("no content for first candidate")
+	ErrNilPartForCandidate = fmt.Errorf("first part is nil for first candidate")
+)
+
+func extractContentFromResponse(resp *genai.GenerateContentResponse) ([]byte, error) {
+	if len(resp.Candidates) == 0 {
+		return nil, ErrNoCandidate
+	}
+
+	if resp.Candidates[0].Content == nil {
+		return nil, ErrNoContent
+	}
+
+	if len(resp.Candidates[0].Content.Parts) == 0 {
+		return nil, ErrNoPartsForCandidate
+	}
+
+	if resp.Candidates[0].Content.Parts[0] == nil {
+		return nil, ErrNilPartForCandidate
+	}
+
+	return []byte(resp.Candidates[0].Content.Parts[0].Text), nil
 }
 
 func extractFilePathsFromChunk(chunk []byte) ([]string, error) {

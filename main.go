@@ -50,7 +50,7 @@ func main() {
 		fs := flag.NewFlagSet("briefer", flag.ExitOnError)
 
 		dir := fs.String("dir", "./staging", "Chunks directory")
-		output := fs.String("output", "database.json", "Output file")
+		output := fs.String("output", "database", "Output file")
 
 		fs.Parse(os.Args[2:])
 
