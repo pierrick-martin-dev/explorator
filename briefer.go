@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,23 +65,34 @@ func (mc *ManagedCache) GetOrCreate(ctx context.Context, client *genai.Client, c
 		return mc.cache, nil
 	}
 
-	cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
-		DisplayName: chunk.name,
-		Contents: []*genai.Content{
-			{Role: "user", Parts: []*genai.Part{{Text: string(chunk.content)}}},
-		},
-		TTL: 3600 * time.Second,
-	})
+	attempt := 0
 
-	if err != nil {
-		return nil, fmt.Errorf("client.Caches.Create(): %w", err)
+	for {
+		cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
+			DisplayName: chunk.name,
+			Contents: []*genai.Content{
+				{Role: "user", Parts: []*genai.Part{{Text: string(chunk.content)}}},
+			},
+			TTL: 3600 * time.Second,
+		})
+		if err == nil {
+			mc.cache = cache
+			break
+		}
+
+		waitWithBackoff(attempt)
+		attempt++
 	}
 
-	mc.cache = cache
-	return cache, nil
+	return mc.cache, nil
 }
 
-type Briefer = func(ctx context.Context, client *genai.Client, chunk *Chunk, filepath string, temp float32) (Brief, error)
+type Briefer int
+
+const (
+	WithCache Briefer = iota
+	WithoutCache
+)
 
 type AnalysisTask struct {
 	FilePath   string
@@ -100,7 +113,7 @@ func NewLimiter(requestsPerMinute int) *Limiter {
 	limit := rate.Every(time.Minute / time.Duration(requestsPerMinute))
 
 	return &Limiter{
-		rateLimiter: rate.NewLimiter(limit, 5),
+		rateLimiter: rate.NewLimiter(limit, 3),
 	}
 }
 
@@ -177,9 +190,9 @@ func (l *Limiter) Plan(ctx context.Context, client *genai.Client, srcDir, outDir
 
 		chunk.cache.activeFiles.Store(int32(len(remainingFiles)))
 
-		briefer := Briefer(BriefChunkWithoutCache)
+		briefer := WithoutCache
 		if len(chunkData) > 4096 {
-			briefer = BriefChunkWithCache
+			briefer = WithCache
 		}
 
 		for _, f := range remainingFiles {
@@ -246,7 +259,7 @@ func (l *Limiter) Execute(ctx context.Context, client *genai.Client) error {
 
 func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, src, output string) error {
 	start := time.Now()
-	limiter := NewLimiter(30)
+	limiter := NewLimiter(15)
 	if err := limiter.Plan(ctx, client, src, output); err != nil {
 		return fmt.Errorf("limiter.Plan(): %w", err)
 	}
@@ -290,31 +303,63 @@ var (
 
 func retryBrief(ctx context.Context, client *genai.Client, task *AnalysisTask) (Brief, error) {
 	var lastError error
+	attempt := 0
+	rateLimitAttemp := 0
 
-	for range maxRetries {
-		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	briefer := BriefChunkWithoutCache
+	if task.Briefer == WithCache {
+		briefer = BriefChunkWithCache
 
-		brief, err := task.Briefer(ctx, client, task.Chunk, task.FilePath, task.Temp)
+		cache, err := task.Chunk.cache.GetOrCreate(ctx, client, task.Chunk)
+		if err != nil {
+			return nil, fmt.Errorf("getOrCreateCache(): %w", err)
+		}
+
+		task.Chunk.cache.cache = cache
+	}
+
+	for {
+		if attempt >= maxRetries {
+			return nil, fmt.Errorf("maximum retries reached, last error %w", lastError)
+		}
+
+		timeoutCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+
+		brief, err := briefer(timeoutCtx, client, task.Chunk, task.FilePath, task.Temp)
 		cancel()
 
 		if err == nil {
+			if rateLimitAttemp > 10 {
+				fmt.Printf("spetacular rateLimitAttemp %d\n", rateLimitAttemp)
+			}
 			return brief, nil
 		}
+		lastError = err
 
 		if strings.Contains(err.Error(), "429") {
-			time.Sleep(10 * time.Second)
+			rateLimitAttemp++
 			lastError = ErrRateLimited
-		}
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			task.Temp += 0.3
+			waitWithBackoff(rateLimitAttemp)
+		} else if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "The operation was cancelled") || strings.Contains(err.Error(), "Deadline expired before operation could complete") {
+			task.Temp = float32(math.Min(float64(task.Temp+0.3), 1.0))
 			lastError = ErrContextExpired
+			attempt++
+		} else {
+			return nil, fmt.Errorf("briefer(%q): %w", task.FilePath, err)
 		}
+	}
+}
 
-		lastError = err
+func waitWithBackoff(attempt int) {
+	delay := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+
+	if delay > 60*time.Second {
+		delay = 60 * time.Second
 	}
 
-	return nil, fmt.Errorf("maximum retries reached, last error %w", lastError)
+	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+
+	time.Sleep(delay + jitter)
 }
 
 func cleanupChunk(ctx context.Context, client *genai.Client, chunk *Chunk) error {
@@ -352,12 +397,7 @@ func listCaches(ctx context.Context, client *genai.Client) ([]*genai.CachedConte
 }
 
 func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string, temp float32) (Brief, error) {
-	cache, err := chunk.cache.GetOrCreate(ctx, client, chunk)
-	if err != nil {
-		return nil, fmt.Errorf("getOrCreateCache(): %w", err)
-	}
-
-	resp, err := requestAnalyseWithCache(ctx, client, path, cache, temp)
+	resp, err := requestAnalyseWithCache(ctx, client, path, chunk.cache.cache, temp)
 	if err != nil {
 		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 	}
@@ -380,6 +420,8 @@ func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path str
 			ResponseSchema:   analyseSchema(),
 			SafetySettings:   safetySettings(),
 			Temperature:      &temp,
+			PresencePenalty:  newT(float32(0.1)),
+			FrequencyPenalty: newT(float32(0.3)),
 		},
 	)
 }
@@ -407,8 +449,14 @@ func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path 
 			ResponseSchema:   analyseSchema(),
 			SafetySettings:   safetySettings(),
 			Temperature:      &temp,
+			PresencePenalty:  newT(float32(0.1)),
+			FrequencyPenalty: newT(float32(0.3)),
 		},
 	)
+}
+
+func newT[T any](v T) *T {
+	return &v
 }
 
 func safetySettings() []*genai.SafetySetting {
