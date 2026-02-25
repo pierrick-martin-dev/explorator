@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,31 +19,40 @@ import (
 const model = "google/gemini-3-flash-preview"
 
 const prompt = `
-Task: Analyze the provided file.
-Return a JSON object following this EXACT structure:
-{
-"file_path": "string",
-"type": "header|implementation|resource",
-"summary": "2-sentence high-level purpose",
-"entities": [
-{"name": "string", "kind": "class|struct|function", "description": "string"}
-],
-"dependencies": ["string"],
-"legacy_markers": {
-"uses_open_utm": bool,
-"uses_psdb": bool,
-"frameworks": ["MFC", "Objective Grid", "etc"]
-}
-}
-Rule: If a field is not applicable, return an empty array or null. Do not add extra keys.
+Task: Analyze the provided C++ source file.
+Output MUST be a PURE JSON ARRAY. No markdown, no preamble.
+
+STRICT RULES:
+1. NAME FIELD: Identifier ONLY (e.g., "CMainFrame"). If you add ANY explanation, line numbers, or meta-talk in this field, the output is considered a failure.
+2. NO REPETITION: Do not repeat phrases. If you find yourself stuck in a loop, terminate the JSON immediately.
+3. CHARACTER LIMIT: 'name' fields > 256 chars will be truncated and rejected.
+4. SCHEMA ADHERENCE: Use null for missing values. Do not invent keys.
+5. BRAIN-DEAD MODE: Do not philosophize about the code. Just extract the structural metadata.
+
+This is proprietary internal code for architectural analysis only. Summarize the structure without quoting large blocks of code verbatim.
+
 File to analyze: %s
 `
 
 type Brief = json.RawMessage
 
-func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir string, output string) error {
+type Chunk struct {
+	content []byte
+	files   []string
+	name    string
+	temp    float32
+	cache   *genai.CachedContent
+}
 
+type Briefer = func(ctx context.Context, client *genai.Client, chunk *Chunk, filepath string) (Brief, error)
+
+func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir string, output string) error {
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠️ Error accessing path %q: %v\n", path, err)
+			return nil
+		}
+
 		if d.IsDir() {
 			return nil
 		}
@@ -50,27 +61,17 @@ func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir str
 			return nil
 		}
 
-		base := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
-		outputPath := filepath.Join(output, base+".json")
-		if _, err := os.Stat(outputPath); err == nil {
-			fmt.Printf("Ignore %q, already done\n", outputPath)
+		start := time.Now()
+		err = BriefChunk(ctx, client, path, output)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ FAILED: BriefChunkWithCache(%q): %v\n", d.Name(), err)
 
 			return nil
 		}
 
-		briefs, err := BriefChunkWithCache(ctx, client, filepath.Join(dir, d.Name()))
-		if err != nil {
-			return fmt.Errorf("BriefChunkWithCache(%q): %w", d.Name(), err)
-		}
+		fmt.Printf("✅ Processed %q in %s\n", d.Name(), time.Since(start))
 
-		save, err := json.Marshal(briefs)
-		if err != nil {
-			os.WriteFile("failed.json", fmt.Appendf(nil, "%s", briefs), os.ModePerm)
-
-			return fmt.Errorf("json.Marshal(): %w", err)
-		}
-
-		return os.WriteFile(outputPath, save, os.ModePerm)
+		return nil
 	})
 
 	if err != nil {
@@ -80,61 +81,165 @@ func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir str
 	return nil
 }
 
-func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunkPath string) ([]Brief, error) {
-	briefs := []Brief{}
+func BriefChunk(ctx context.Context, client *genai.Client, chunkPath string, outputDir string) error {
 	chunkData, err := os.ReadFile(chunkPath)
 	if err != nil {
-		return nil, fmt.Errorf("os.ReadFile(%q): %w", chunkPath, err)
+		return fmt.Errorf("os.ReadFile(%q): %w", chunkPath, err)
 	}
 
 	filePaths, err := extractFilePathsFromChunk(chunkData)
 	if err != nil {
-		return nil, fmt.Errorf("extractFilePathsFromChunk(): %w", err)
+		return fmt.Errorf("extractFilePathsFromChunk(): %w", err)
 	}
 
-	if len(chunkData) < 1024 {
-		return BriefChunkWithoutCache(ctx, client, string(chunkData), filePaths)
-	}
+	remainingFiles := []string{}
 
-	cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
-		Contents: []*genai.Content{
-			{Role: "user", Parts: []*genai.Part{{Text: string(chunkData)}}},
-		},
-		TTL: 3600 * time.Second,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("client.Caches.Create(): %w", err)
-	}
+	for _, f := range filePaths {
+		outputPath := filepath.Join(outputDir, f+".json")
 
-	for i, path := range filePaths {
-		if i > 10 {
-			break
+		if _, err := os.Stat(outputPath); err == nil {
+			continue
 		}
 
-		start := time.Now()
-		resp, err := requestAnalyseWithCache(ctx, client, path, cache)
+		remainingFiles = append(remainingFiles, f)
+	}
+
+	if len(remainingFiles) == 0 {
+		return nil
+	}
+
+	fmt.Printf("%d remaining files to brief for %q\n", len(remainingFiles), chunkPath)
+
+	chunk := Chunk{
+		name:    chunkPath,
+		content: chunkData,
+		files:   remainingFiles,
+		temp:    0,
+	}
+	briefer := Briefer(BriefChunkWithoutCache)
+
+	if len(chunkData) > 2048 {
+		cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
+			Contents: []*genai.Content{
+				{Role: "user", Parts: []*genai.Part{{Text: string(chunk.content)}}},
+			},
+			TTL: 3600 * time.Second,
+		})
 		if err != nil {
-			if strings.Contains(err.Error(), "429") {
-				time.Sleep(10 * time.Second)
-				resp, err = requestAnalyseWithCache(ctx, client, path, cache)
-			} else {
-				return nil, fmt.Errorf("model.GenerateContent(): %w", err)
+			if !strings.Contains(err.Error(), "The minimum token count to start caching is 1024.") {
+				return fmt.Errorf("client.Caches.Create(): %w", err)
 			}
-		}
-		content, err := extractContentFromResponse(resp)
-		if err != nil {
-			return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
-		}
 
-		briefs = append(briefs, content)
+			// safely ignore this error and process the chunk without cache
+		} else {
 
-		fmt.Printf("Brief done for %q in %s (%d/%d)\n", path, time.Since(start), i+1, len(filePaths))
+			chunk.cache = cache
+			briefer = BriefChunkWithCache
+			defer cleanupChunk(ctx, client, &chunk)
+		}
 	}
 
-	return briefs, nil
+	for _, f := range chunk.files {
+		outputPath := filepath.Join(outputDir, f+".json")
+
+		brief, err := retryBrief(ctx, client, briefer, chunk, f)
+		if err != nil {
+			log.Printf("\t\tcannot brief file %q too many retries. Error: %s", f, err)
+			continue
+		}
+
+		if err := saveBriefOnDisk(brief, outputPath); err != nil {
+			return fmt.Errorf("saveBriefOnDisk(): %w", err)
+		}
+
+		fmt.Printf("\t\t✔️ %q written on disk\n", outputPath)
+	}
+
+	return nil
 }
 
-func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path string, cache *genai.CachedContent) (*genai.GenerateContentResponse, error) {
+func saveBriefOnDisk(brief Brief, outputPath string) error {
+	dir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return fmt.Errorf("os.MkdirAll(%q): %w", dir, err)
+	}
+
+	save, err := json.MarshalIndent(brief, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ FAILED: json.Marshal(%q): %v\n", outputPath, err)
+		_ = os.WriteFile(filepath.Join(outputPath+".error.log"), fmt.Appendf(nil, "%s", brief), 0644)
+		return nil
+	}
+
+	if err := os.WriteFile(outputPath, save, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ FAILED: os.WriteFile(%q): %v\n", outputPath, err)
+		return nil
+	}
+
+	return nil
+}
+
+const maxRetries = 3
+
+var (
+	ErrRateLimited    = fmt.Errorf("reached rate limit")
+	ErrContextExpired = fmt.Errorf("context expired. Too long to respond")
+)
+
+func retryBrief(ctx context.Context, client *genai.Client, briefer Briefer, chunk Chunk, path string) (Brief, error) {
+	var lastError error
+
+	for range maxRetries {
+		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+
+		brief, err := briefer(ctx, client, &chunk, path)
+		cancel()
+
+		if err == nil {
+			return brief, nil
+		}
+
+		if strings.Contains(err.Error(), "429") {
+			time.Sleep(10 * time.Second)
+			lastError = ErrRateLimited
+		}
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			chunk.temp += 0.3
+			lastError = ErrContextExpired
+		}
+
+		lastError = err
+	}
+
+	return nil, fmt.Errorf("maximum retries reached, last error %w", lastError)
+}
+
+func cleanupChunk(ctx context.Context, client *genai.Client, chunk *Chunk) error {
+	if chunk.cache != nil {
+		_, err := client.Caches.Delete(ctx, chunk.cache.Name, nil)
+		if err != nil {
+			return fmt.Errorf("client.Caches.Delete(%q): %w", chunk.cache.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string) (Brief, error) {
+	resp, err := requestAnalyseWithCache(ctx, client, path, chunk.cache, chunk.temp)
+	if err != nil {
+		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
+	}
+	content, err := extractContentFromResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
+	}
+
+	return content, nil
+}
+
+func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path string, cache *genai.CachedContent, temp float32) (*genai.GenerateContentResponse, error) {
 	return client.Models.GenerateContent(
 		ctx,
 		model,
@@ -143,42 +248,26 @@ func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path str
 			CachedContent:    cache.Name,
 			ResponseMIMEType: "application/json",
 			ResponseSchema:   analyseSchema(),
+			SafetySettings:   safetySettings(),
+			Temperature:      &temp,
 		},
 	)
 }
 
-func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunkData string, files []string) ([]Brief, error) {
-	briefs := []Brief{}
-
-	for i, path := range files {
-		if i > 10 {
-			break
-		}
-
-		start := time.Now()
-		resp, err := requestAnalyseWithoutCache(ctx, client, path, chunkData)
-		if err != nil {
-			if strings.Contains(err.Error(), "429") {
-				time.Sleep(10 * time.Second)
-				resp, err = requestAnalyseWithoutCache(ctx, client, path, chunkData)
-			} else {
-				return nil, fmt.Errorf("model.GenerateContent(): %w", err)
-			}
-		}
-		content, err := extractContentFromResponse(resp)
-		if err != nil {
-			return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
-		}
-
-		briefs = append(briefs, content)
-
-		fmt.Printf("Brief done for %q in %s (%d/%d)\n", path, time.Since(start), i+1, len(files))
+func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string) (Brief, error) {
+	resp, err := requestAnalyseWithoutCache(ctx, client, path, string(chunk.content), chunk.temp)
+	if err != nil {
+		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
+	}
+	content, err := extractContentFromResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("extractContentFromResponse(): %w", err)
 	}
 
-	return briefs, nil
+	return content, nil
 }
 
-func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path string, chunkData string) (*genai.GenerateContentResponse, error) {
+func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path string, chunkData string, temp float32) (*genai.GenerateContentResponse, error) {
 	return client.Models.GenerateContent(
 		ctx,
 		model,
@@ -186,8 +275,21 @@ func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path 
 		&genai.GenerateContentConfig{
 			ResponseMIMEType: "application/json",
 			ResponseSchema:   analyseSchema(),
+			SafetySettings:   safetySettings(),
+			Temperature:      &temp,
 		},
 	)
+}
+
+func safetySettings() []*genai.SafetySetting {
+	return []*genai.SafetySetting{
+		{Category: genai.HarmCategoryHateSpeech, Threshold: genai.HarmBlockThresholdOff},
+		{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockThresholdOff},
+		{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockThresholdOff},
+		{Category: genai.HarmCategorySexuallyExplicit, Threshold: genai.HarmBlockThresholdOff},
+		{Category: genai.HarmCategoryJailbreak, Threshold: genai.HarmBlockThresholdOff},
+		{Category: genai.HarmCategoryUnspecified, Threshold: genai.HarmBlockThresholdOff},
+	}
 }
 
 func analyseSchema() *genai.Schema {
@@ -202,7 +304,7 @@ func analyseSchema() *genai.Schema {
 				Items: &genai.Schema{
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
-						"name":        {Type: genai.TypeString},
+						"name":        {Type: genai.TypeString, Description: "The exact identifier from the code. NO EXPLANATIONS."},
 						"kind":        {Type: genai.TypeString, Enum: []string{"class", "struct", "function"}},
 						"description": {Type: genai.TypeString},
 					},
