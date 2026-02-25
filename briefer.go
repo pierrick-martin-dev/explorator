@@ -11,8 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/genai"
 )
 
@@ -38,16 +41,73 @@ type Brief = json.RawMessage
 
 type Chunk struct {
 	content []byte
-	files   []string
 	name    string
-	temp    float32
-	cache   *genai.CachedContent
+	cache   ManagedCache
 }
 
-type Briefer = func(ctx context.Context, client *genai.Client, chunk *Chunk, filepath string) (Brief, error)
+type ManagedCache struct {
+	activeFiles atomic.Int32
+	cache       *genai.CachedContent
+	creationMu  sync.Mutex
+}
 
-func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir string, output string) error {
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+func (mc *ManagedCache) GetOrCreate(ctx context.Context, client *genai.Client, chunk *Chunk) (*genai.CachedContent, error) {
+	if mc.cache != nil {
+		return mc.cache, nil
+	}
+
+	mc.creationMu.Lock()
+	defer mc.creationMu.Unlock()
+
+	if mc.cache != nil {
+		return mc.cache, nil
+	}
+
+	cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
+		DisplayName: chunk.name,
+		Contents: []*genai.Content{
+			{Role: "user", Parts: []*genai.Part{{Text: string(chunk.content)}}},
+		},
+		TTL: 3600 * time.Second,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("client.Caches.Create(): %w", err)
+	}
+
+	mc.cache = cache
+	return cache, nil
+}
+
+type Briefer = func(ctx context.Context, client *genai.Client, chunk *Chunk, filepath string, temp float32) (Brief, error)
+
+type AnalysisTask struct {
+	FilePath   string
+	Chunk      *Chunk
+	Temp       float32
+	Attempt    int
+	OutputPath string
+	Briefer    Briefer
+}
+
+type Limiter struct {
+	rateLimiter *rate.Limiter
+	wg          sync.WaitGroup
+	tasks       []*AnalysisTask
+}
+
+func NewLimiter(requestsPerMinute int) *Limiter {
+	limit := rate.Every(time.Minute / time.Duration(requestsPerMinute))
+
+	return &Limiter{
+		rateLimiter: rate.NewLimiter(limit, 5),
+	}
+}
+
+func (l *Limiter) Plan(ctx context.Context, client *genai.Client, srcDir, outDir string) error {
+	chunkPaths := []string{}
+
+	err := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "⚠️ Error accessing path %q: %v\n", path, err)
 			return nil
@@ -61,98 +121,140 @@ func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, dir str
 			return nil
 		}
 
-		start := time.Now()
-		err = BriefChunk(ctx, client, path, output)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "❌ FAILED: BriefChunkWithCache(%q): %v\n", d.Name(), err)
-
-			return nil
-		}
-
-		fmt.Printf("✅ Processed %q in %s\n", d.Name(), time.Since(start))
+		chunkPaths = append(chunkPaths, filepath.Join(srcDir, d.Name()))
 
 		return nil
 	})
-
 	if err != nil {
-		return fmt.Errorf("filepath.WalkDir(%q): %w", dir, err)
+		return fmt.Errorf("filepath.WalkDir(%q): %w", srcDir, err)
+	}
+
+	fmt.Printf("Found %d chunks to brief\n", len(chunkPaths))
+
+	caches, err := listCaches(ctx, client)
+	if err != nil {
+		return fmt.Errorf("listCaches(): %w", err)
+	}
+
+	fmt.Printf("Found %d caches to reuse\n", len(caches))
+
+	for _, cPath := range chunkPaths {
+		chunkData, err := os.ReadFile(cPath)
+		if err != nil {
+			return fmt.Errorf("os.ReadFile(%q): %w", cPath, err)
+		}
+
+		filePaths, err := extractFilePathsFromChunk(chunkData)
+		if err != nil {
+			return fmt.Errorf("extractFilePathsFromChunk(): %w", err)
+		}
+
+		remainingFiles := []string{}
+
+		for _, f := range filePaths {
+			outputPath := filepath.Join(outDir, f+".json")
+
+			if _, err := os.Stat(outputPath); err == nil {
+				continue
+			}
+
+			remainingFiles = append(remainingFiles, f)
+		}
+
+		if len(remainingFiles) == 0 {
+			continue
+		}
+
+		chunk := Chunk{
+			name:    cPath,
+			content: chunkData,
+		}
+
+		potentialCache := findCacheForChunks(caches, &chunk)
+		if potentialCache != nil {
+			chunk.cache.cache = potentialCache
+		}
+
+		chunk.cache.activeFiles.Store(int32(len(remainingFiles)))
+
+		briefer := Briefer(BriefChunkWithoutCache)
+		if len(chunkData) > 4096 {
+			briefer = BriefChunkWithCache
+		}
+
+		for _, f := range remainingFiles {
+			outputPath := filepath.Join(outDir, f+".json")
+
+			l.tasks = append(l.tasks, &AnalysisTask{
+				FilePath:   f,
+				Chunk:      &chunk,
+				Temp:       0,
+				OutputPath: outputPath,
+				Briefer:    briefer,
+			})
+		}
 	}
 
 	return nil
 }
 
-func BriefChunk(ctx context.Context, client *genai.Client, chunkPath string, outputDir string) error {
-	chunkData, err := os.ReadFile(chunkPath)
-	if err != nil {
-		return fmt.Errorf("os.ReadFile(%q): %w", chunkPath, err)
+func findCacheForChunks(caches []*genai.CachedContent, chunk *Chunk) *genai.CachedContent {
+	for _, c := range caches {
+		if c.DisplayName == chunk.name {
+			return c
+		}
 	}
 
-	filePaths, err := extractFilePathsFromChunk(chunkData)
-	if err != nil {
-		return fmt.Errorf("extractFilePathsFromChunk(): %w", err)
-	}
+	return nil
+}
 
-	remainingFiles := []string{}
-
-	for _, f := range filePaths {
-		outputPath := filepath.Join(outputDir, f+".json")
-
-		if _, err := os.Stat(outputPath); err == nil {
-			continue
+func (l *Limiter) Execute(ctx context.Context, client *genai.Client) error {
+	for _, task := range l.tasks {
+		if err := l.rateLimiter.Wait(ctx); err != nil {
+			return fmt.Errorf("l.rateLimiter.Wait(): %w", err)
 		}
 
-		remainingFiles = append(remainingFiles, f)
-	}
+		l.wg.Go(func() {
+			start := time.Now()
+			brief, err := retryBrief(ctx, client, task)
+			remaining := task.Chunk.cache.activeFiles.Add(-1)
+			if remaining == 0 {
+				if err := cleanupChunk(ctx, client, task.Chunk); err != nil {
+					log.Printf("cannot cleanupChunk %q: %s", task.Chunk.name, err)
+				}
 
-	if len(remainingFiles) == 0 {
-		return nil
-	}
-
-	fmt.Printf("%d remaining files to brief for %q\n", len(remainingFiles), chunkPath)
-
-	chunk := Chunk{
-		name:    chunkPath,
-		content: chunkData,
-		files:   remainingFiles,
-		temp:    0,
-	}
-	briefer := Briefer(BriefChunkWithoutCache)
-
-	if len(chunkData) > 2048 {
-		cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
-			Contents: []*genai.Content{
-				{Role: "user", Parts: []*genai.Part{{Text: string(chunk.content)}}},
-			},
-			TTL: 3600 * time.Second,
-		})
-		if err != nil {
-			if !strings.Contains(err.Error(), "The minimum token count to start caching is 1024.") {
-				return fmt.Errorf("client.Caches.Create(): %w", err)
+				log.Printf("✅ Chunk %q completed\n", task.Chunk.name)
 			}
 
-			// safely ignore this error and process the chunk without cache
-		} else {
+			if err != nil {
+				log.Printf("\t\t❌ cannot brief file %q too many retries. Error: %s", task.FilePath, err)
+				return
+			}
 
-			chunk.cache = cache
-			briefer = BriefChunkWithCache
-			defer cleanupChunk(ctx, client, &chunk)
-		}
+			if err := saveBriefOnDisk(brief, task.OutputPath); err != nil {
+				log.Printf("\t\t❌ cannot saveBriefOnDisk %q: %s", task.OutputPath, err)
+			}
+
+			fmt.Printf("\t\t✔️ %q saved on disk for %q in %s\n", task.OutputPath, task.Chunk.name, time.Since(start))
+		})
 	}
 
-	for _, f := range chunk.files {
-		outputPath := filepath.Join(outputDir, f+".json")
+	l.wg.Wait()
 
-		brief, err := retryBrief(ctx, client, briefer, chunk, f)
-		if err != nil {
-			log.Printf("\t\tcannot brief file %q too many retries. Error: %s", f, err)
-			continue
-		}
+	return nil
+}
 
-		if err := saveBriefOnDisk(brief, outputPath); err != nil {
-			return fmt.Errorf("saveBriefOnDisk(): %w", err)
-		}
+func GenerateBriefsFromChunks(ctx context.Context, client *genai.Client, src, output string) error {
+	start := time.Now()
+	limiter := NewLimiter(30)
+	if err := limiter.Plan(ctx, client, src, output); err != nil {
+		return fmt.Errorf("limiter.Plan(): %w", err)
+	}
 
-		fmt.Printf("\t\t✔️ %q written on disk\n", outputPath)
+	fmt.Printf("Planned %d tasks in %s\n", len(limiter.tasks), time.Since(start))
+
+	if err := limiter.Execute(ctx, client); err != nil {
+		return fmt.Errorf("limiter.Execute(): %w", err)
 	}
 
 	return nil
@@ -186,13 +288,13 @@ var (
 	ErrContextExpired = fmt.Errorf("context expired. Too long to respond")
 )
 
-func retryBrief(ctx context.Context, client *genai.Client, briefer Briefer, chunk Chunk, path string) (Brief, error) {
+func retryBrief(ctx context.Context, client *genai.Client, task *AnalysisTask) (Brief, error) {
 	var lastError error
 
 	for range maxRetries {
 		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 
-		brief, err := briefer(ctx, client, &chunk, path)
+		brief, err := task.Briefer(ctx, client, task.Chunk, task.FilePath, task.Temp)
 		cancel()
 
 		if err == nil {
@@ -205,7 +307,7 @@ func retryBrief(ctx context.Context, client *genai.Client, briefer Briefer, chun
 		}
 
 		if errors.Is(err, context.DeadlineExceeded) {
-			chunk.temp += 0.3
+			task.Temp += 0.3
 			lastError = ErrContextExpired
 		}
 
@@ -216,18 +318,46 @@ func retryBrief(ctx context.Context, client *genai.Client, briefer Briefer, chun
 }
 
 func cleanupChunk(ctx context.Context, client *genai.Client, chunk *Chunk) error {
-	if chunk.cache != nil {
-		_, err := client.Caches.Delete(ctx, chunk.cache.Name, nil)
+	if chunk.cache.cache != nil {
+		_, err := client.Caches.Delete(ctx, chunk.cache.cache.Name, nil)
 		if err != nil {
-			return fmt.Errorf("client.Caches.Delete(%q): %w", chunk.cache.Name, err)
+			return fmt.Errorf("client.Caches.Delete(%q): %w", chunk.cache.cache.Name, err)
 		}
 	}
 
 	return nil
 }
 
-func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string) (Brief, error) {
-	resp, err := requestAnalyseWithCache(ctx, client, path, chunk.cache, chunk.temp)
+func listCaches(ctx context.Context, client *genai.Client) ([]*genai.CachedContent, error) {
+	caches := []*genai.CachedContent{}
+	page, err := client.Caches.List(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("client.Caches.List(): %w", err)
+	}
+
+	for {
+		caches = append(caches, page.Items...)
+
+		page, err = page.Next(ctx)
+		if err != nil {
+			if errors.Is(err, genai.ErrPageDone) {
+				break
+			}
+
+			return nil, fmt.Errorf("client.Caches.List(): %w", err)
+		}
+	}
+
+	return caches, nil
+}
+
+func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string, temp float32) (Brief, error) {
+	cache, err := chunk.cache.GetOrCreate(ctx, client, chunk)
+	if err != nil {
+		return nil, fmt.Errorf("getOrCreateCache(): %w", err)
+	}
+
+	resp, err := requestAnalyseWithCache(ctx, client, path, cache, temp)
 	if err != nil {
 		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 	}
@@ -254,8 +384,8 @@ func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path str
 	)
 }
 
-func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string) (Brief, error) {
-	resp, err := requestAnalyseWithoutCache(ctx, client, path, string(chunk.content), chunk.temp)
+func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string, temp float32) (Brief, error) {
+	resp, err := requestAnalyseWithoutCache(ctx, client, path, string(chunk.content), temp)
 	if err != nil {
 		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 	}

@@ -2,7 +2,10 @@ module github.com/pierrick-martin-dev/autoingest
 
 go 1.25.5
 
-require google.golang.org/genai v1.47.0
+require (
+	golang.org/x/time v0.11.0
+	google.golang.org/genai v1.47.0
+)
 
 require (
 	cloud.google.com/go v0.121.2 // indirect
