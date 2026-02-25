@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +11,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,20 +24,32 @@ import (
 
 const model = "google/gemini-3-flash-preview"
 
-const prompt = `
-Task: Analyze the provided C++ source file.
-Output MUST be a PURE JSON ARRAY. No markdown, no preamble.
+const cppPrompt = `
+Task: Analyze the following C/C++ component.
+The codebase context (including these files) is loaded in your memory.
 
-STRICT RULES:
-1. NAME FIELD: Identifier ONLY (e.g., "CMainFrame"). If you add ANY explanation, line numbers, or meta-talk in this field, the output is considered a failure.
-2. NO REPETITION: Do not repeat phrases. If you find yourself stuck in a loop, terminate the JSON immediately.
-3. CHARACTER LIMIT: 'name' fields > 256 chars will be truncated and rejected.
-4. SCHEMA ADHERENCE: Use null for missing values. Do not invent keys.
-5. BRAIN-DEAD MODE: Do not philosophize about the code. Just extract the structural metadata.
+Rules for Extraction:
+1. NAME: Extract the exact identifier (e.g., "CMainFrame"). Keep it strictly under 256 characters.
+2. SYNTHESIS: Read the header (.h/.hpp) to identify the entities (classes, structs, functions). Read the implementation (.c/.cpp) to determine the legacy markers (e.g., uses_open_utm, uses_psdb) and dependencies.
+3. CONCISENESS: Provide a structural summary. Do not output raw code blocks.
 
-This is proprietary internal code for architectural analysis only. Summarize the structure without quoting large blocks of code verbatim.
+Files making up this component:
+%s
+`
 
-File to analyze: %s
+const lightweightPrompt = `
+Task: Analyze the following build script, configuration, or data file.
+The codebase context is loaded in your memory.
+
+Rules for Extraction:
+1. SUMMARY: Provide a strictly factual, 1-2 sentence explanation of what this file controls, builds, or configures.
+2. KEY ELEMENTS: 
+   - If this is a Makefile or build script, list the primary execution targets (e.g., "all", "clean", "build").
+   - If this is an XML or config file, list the root or most critical configuration nodes/keys.
+3. REFERENCES: List only the exact filenames, modules, or scripts explicitly imported, included, or executed by this file.
+
+Files making up this component:
+%s
 `
 
 type Brief = json.RawMessage
@@ -68,6 +81,10 @@ func (mc *ManagedCache) GetOrCreate(ctx context.Context, client *genai.Client, c
 	attempt := 0
 
 	for {
+		if attempt > 500 {
+			return nil, ErrTooMuchRetries
+		}
+
 		cache, err := client.Caches.Create(ctx, model, &genai.CreateCachedContentConfig{
 			DisplayName: chunk.name,
 			Contents: []*genai.Content{
@@ -94,8 +111,89 @@ const (
 	WithoutCache
 )
 
+type ComponentType string
+
+const (
+	CppComponent          ComponentType = "cpp_component"
+	MakefileComponent     ComponentType = "makefile"
+	XmlComponent          ComponentType = "config"
+	RationalRoseComponent ComponentType = "rational rose"
+	ShellComponent        ComponentType = "shell"
+	OtherComponent        ComponentType = "other"
+)
+
+type LogicalComponent struct {
+	BaseName  string
+	Dir       string
+	FilePaths []string
+	Type      ComponentType
+}
+
+func GroupFiles(allFiles []string) []*LogicalComponent {
+	componentsMap := make(map[string]*LogicalComponent)
+	var standalone []*LogicalComponent
+
+	for _, path := range allFiles {
+		ext := filepath.Ext(path)
+		dir := filepath.Dir(path)
+		base := filepath.Base(path)
+		nameWithoutExt := strings.TrimSuffix(base, ext)
+
+		if isCppFile(base) {
+			output := filepath.Join(dir, nameWithoutExt)
+			groupKey := filepath.Join(dir, nameWithoutExt)
+
+			if _, exists := componentsMap[groupKey]; !exists {
+				componentsMap[groupKey] = &LogicalComponent{
+					BaseName:  output,
+					Dir:       dir,
+					FilePaths: []string{},
+					Type:      CppComponent,
+				}
+			}
+			componentsMap[groupKey].FilePaths = append(componentsMap[groupKey].FilePaths, path)
+		} else {
+			fileType := OtherComponent
+			if isXml(base) {
+				fileType = XmlComponent
+			}
+			if isMakefile(base) {
+				fileType = MakefileComponent
+			}
+
+			if isRationalRose(base) {
+				fileType = RationalRoseComponent
+			}
+			output := path
+
+			standalone = append(standalone, &LogicalComponent{
+				BaseName:  output,
+				Dir:       dir,
+				FilePaths: []string{path},
+				Type:      fileType,
+			})
+		}
+	}
+
+	var results []*LogicalComponent
+	for _, comp := range componentsMap {
+		sort.Slice(comp.FilePaths, func(i, j int) bool {
+			return comp.FilePaths[i] > comp.FilePaths[j]
+		})
+		results = append(results, comp)
+	}
+
+	results = append(results, standalone...)
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].BaseName < results[j].BaseName
+	})
+
+	return results
+}
+
 type AnalysisTask struct {
-	FilePath   string
+	Component  *LogicalComponent
 	Chunk      *Chunk
 	Temp       float32
 	Attempt    int
@@ -162,25 +260,28 @@ func (l *Limiter) Plan(ctx context.Context, client *genai.Client, srcDir, outDir
 			return fmt.Errorf("extractFilePathsFromChunk(): %w", err)
 		}
 
-		remainingFiles := []string{}
+		components := GroupFiles(filePaths)
 
-		for _, f := range filePaths {
-			outputPath := filepath.Join(outDir, f+".json")
+		remainingComponents := []*LogicalComponent{}
+
+		for _, c := range components {
+			outputPath := filepath.Join(outDir, c.BaseName+".json")
 
 			if _, err := os.Stat(outputPath); err == nil {
 				continue
 			}
 
-			remainingFiles = append(remainingFiles, f)
+			remainingComponents = append(remainingComponents, c)
 		}
 
-		if len(remainingFiles) == 0 {
+		if len(remainingComponents) == 0 {
 			continue
 		}
 
 		chunk := Chunk{
 			name:    cPath,
 			content: chunkData,
+			cache:   &ManagedCache{},
 		}
 
 		potentialCache := findCacheForChunks(caches, &chunk)
@@ -188,18 +289,18 @@ func (l *Limiter) Plan(ctx context.Context, client *genai.Client, srcDir, outDir
 			chunk.cache.cache = potentialCache
 		}
 
-		chunk.cache.activeFiles.Store(int32(len(remainingFiles)))
+		chunk.cache.activeFiles.Store(int32(len(remainingComponents)))
 
 		briefer := WithoutCache
 		if len(chunkData) > 4096 {
 			briefer = WithCache
 		}
 
-		for _, f := range remainingFiles {
-			outputPath := filepath.Join(outDir, f+".json")
+		for _, c := range remainingComponents {
+			outputPath := filepath.Join(outDir, c.BaseName+".json")
 
 			l.tasks = append(l.tasks, &AnalysisTask{
-				FilePath:   f,
+				Component:  c,
 				Chunk:      &chunk,
 				Temp:       0,
 				OutputPath: outputPath,
@@ -228,19 +329,18 @@ func (l *Limiter) Execute(ctx context.Context, client *genai.Client) error {
 		}
 
 		l.wg.Go(func() {
+			defer func() {
+				if remaining := task.Chunk.cache.activeFiles.Add(-1); remaining == 0 {
+					_ = cleanupChunk(ctx, client, task.Chunk)
+				}
+				log.Printf("✅ Chunk %q completed\n", task.Chunk.name)
+			}()
+
 			start := time.Now()
 			brief, err := retryBrief(ctx, client, task)
-			remaining := task.Chunk.cache.activeFiles.Add(-1)
-			if remaining == 0 {
-				if err := cleanupChunk(ctx, client, task.Chunk); err != nil {
-					log.Printf("cannot cleanupChunk %q: %s", task.Chunk.name, err)
-				}
-
-				log.Printf("✅ Chunk %q completed\n", task.Chunk.name)
-			}
 
 			if err != nil {
-				log.Printf("\t\t❌ cannot brief file %q too many retries. Error: %s", task.FilePath, err)
+				log.Printf("\t\t❌ cannot brief file %q too many retries. Error: %s", task.Component, err)
 				return
 			}
 
@@ -325,12 +425,12 @@ func retryBrief(ctx context.Context, client *genai.Client, task *AnalysisTask) (
 
 		timeoutCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 
-		brief, err := briefer(timeoutCtx, client, task.Chunk, task.FilePath, task.Temp)
+		brief, err := briefer(timeoutCtx, client, task.Chunk, task.Component, task.Temp)
 		cancel()
 
 		if err == nil {
 			if rateLimitAttemp > 10 {
-				fmt.Printf("spetacular rateLimitAttemp %d\n", rateLimitAttemp)
+				fmt.Printf("spectacular rateLimitAttempt %d\n", rateLimitAttemp)
 			}
 			return brief, nil
 		}
@@ -340,22 +440,20 @@ func retryBrief(ctx context.Context, client *genai.Client, task *AnalysisTask) (
 			rateLimitAttemp++
 			lastError = ErrRateLimited
 			waitWithBackoff(rateLimitAttemp)
-		} else if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "The operation was cancelled") || strings.Contains(err.Error(), "Deadline expired before operation could complete") {
+		} else if errors.Is(err, context.DeadlineExceeded) ||
+			strings.Contains(err.Error(), "The operation was cancelled") ||
+			strings.Contains(err.Error(), "Deadline expired before operation could complete") {
 			task.Temp = float32(math.Min(float64(task.Temp+0.3), 1.0))
 			lastError = ErrContextExpired
 			attempt++
 		} else {
-			return nil, fmt.Errorf("briefer(%q): %w", task.FilePath, err)
+			return nil, fmt.Errorf("briefer(%q): %w", task.Component, err)
 		}
 	}
 }
 
 func waitWithBackoff(attempt int) {
-	delay := time.Duration(math.Pow(2, float64(attempt))) * time.Second
-
-	if delay > 60*time.Second {
-		delay = 60 * time.Second
-	}
+	delay := min(time.Duration(math.Pow(2, float64(attempt)))*time.Second, 60*time.Second)
 
 	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
 
@@ -396,8 +494,8 @@ func listCaches(ctx context.Context, client *genai.Client) ([]*genai.CachedConte
 	return caches, nil
 }
 
-func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string, temp float32) (Brief, error) {
-	resp, err := requestAnalyseWithCache(ctx, client, path, chunk.cache.cache, temp)
+func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk, component *LogicalComponent, temp float32) (Brief, error) {
+	resp, err := requestAnalyseWithCache(ctx, client, component, chunk.cache.cache, temp)
 	if err != nil {
 		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 	}
@@ -409,15 +507,18 @@ func BriefChunkWithCache(ctx context.Context, client *genai.Client, chunk *Chunk
 	return content, nil
 }
 
-func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path string, cache *genai.CachedContent, temp float32) (*genai.GenerateContentResponse, error) {
+func requestAnalyseWithCache(ctx context.Context, client *genai.Client, component *LogicalComponent, cache *genai.CachedContent, temp float32) (*genai.GenerateContentResponse, error) {
+	files := strings.Join(component.FilePaths, "\n- ")
+	prompt, schema := choosePrompt(component)
+
 	return client.Models.GenerateContent(
 		ctx,
 		model,
-		genai.Text(fmt.Sprintf(prompt, path)),
+		genai.Text(fmt.Sprintf(prompt, files)),
 		&genai.GenerateContentConfig{
 			CachedContent:    cache.Name,
 			ResponseMIMEType: "application/json",
-			ResponseSchema:   analyseSchema(),
+			ResponseSchema:   schema,
 			SafetySettings:   safetySettings(),
 			Temperature:      &temp,
 			PresencePenalty:  newT(float32(0.1)),
@@ -426,8 +527,8 @@ func requestAnalyseWithCache(ctx context.Context, client *genai.Client, path str
 	)
 }
 
-func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Chunk, path string, temp float32) (Brief, error) {
-	resp, err := requestAnalyseWithoutCache(ctx, client, path, string(chunk.content), temp)
+func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Chunk, component *LogicalComponent, temp float32) (Brief, error) {
+	resp, err := requestAnalyseWithoutCache(ctx, client, component, string(chunk.content), temp)
 	if err != nil {
 		return nil, fmt.Errorf("model.GenerateContent(): %w", err)
 	}
@@ -439,20 +540,42 @@ func BriefChunkWithoutCache(ctx context.Context, client *genai.Client, chunk *Ch
 	return content, nil
 }
 
-func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, path string, chunkData string, temp float32) (*genai.GenerateContentResponse, error) {
+func requestAnalyseWithoutCache(ctx context.Context, client *genai.Client, component *LogicalComponent, chunkData string, temp float32) (*genai.GenerateContentResponse, error) {
+	files := strings.Join(component.FilePaths, "\n- ")
+	prompt, schema := choosePrompt(component)
+
 	return client.Models.GenerateContent(
 		ctx,
 		model,
-		genai.Text(fmt.Sprintf("File: %s\n", chunkData)+fmt.Sprintf(prompt, path)),
+		genai.Text(fmt.Sprintf("File: %s\n", chunkData)+fmt.Sprintf(prompt, files)),
 		&genai.GenerateContentConfig{
 			ResponseMIMEType: "application/json",
-			ResponseSchema:   analyseSchema(),
+			ResponseSchema:   schema,
 			SafetySettings:   safetySettings(),
 			Temperature:      &temp,
 			PresencePenalty:  newT(float32(0.1)),
 			FrequencyPenalty: newT(float32(0.3)),
 		},
 	)
+}
+
+func choosePrompt(component *LogicalComponent) (string, *genai.Schema) {
+	switch component.Type {
+	case CppComponent:
+		return cppPrompt, analyseSchema()
+	case RationalRoseComponent:
+		return rationalRosePrompt, lightweightSchema()
+	case MakefileComponent:
+		return makefilePrompt, lightweightSchema()
+	case XmlComponent:
+		return xmlPrompt, lightweightSchema()
+	case ShellComponent:
+		return shellPrompt, lightweightSchema()
+	case OtherComponent:
+		fallthrough
+	default:
+		return otherPrompt, lightweightSchema()
+	}
 }
 
 func newT[T any](v T) *T {
@@ -508,6 +631,34 @@ func analyseSchema() *genai.Schema {
 	}
 }
 
+func lightweightSchema() *genai.Schema {
+	return &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"file_path": {Type: genai.TypeString},
+			"type": {
+				Type: genai.TypeString,
+				Enum: []string{"build_script", "configuration", "deployment", "data", "documentation", "other"},
+			},
+			"summary": {
+				Type:        genai.TypeString,
+				Description: "A concise explanation of what this file builds, configures, or executes. Max 2 sentences.",
+			},
+			"references": {
+				Type:        genai.TypeArray,
+				Items:       &genai.Schema{Type: genai.TypeString},
+				Description: "Other files, directories, or modules explicitly referenced or included by this file.",
+			},
+			"key_elements": {
+				Type:        genai.TypeArray,
+				Items:       &genai.Schema{Type: genai.TypeString},
+				Description: "The primary Make targets (if a Makefile), root XML nodes (if XML), or main config keys.",
+			},
+		},
+		Required: []string{"file_path", "type", "summary"},
+	}
+}
+
 var (
 	ErrNoCandidate         = fmt.Errorf("no candidate")
 	ErrNoPartsForCandidate = fmt.Errorf("no parts for first candidate")
@@ -535,27 +686,76 @@ func extractContentFromResponse(resp *genai.GenerateContentResponse) ([]byte, er
 	return []byte(resp.Candidates[0].Content.Parts[0].Text), nil
 }
 
+var (
+	ErrNoPathInChunk = fmt.Errorf("no paths found in <directory_structure> block")
+)
+
 func extractFilePathsFromChunk(chunk []byte) ([]string, error) {
-	buf := bytes.NewBuffer(chunk)
-
-	_, err := buf.ReadString('\n')
-	if err != nil {
-		return nil, fmt.Errorf("buf.ReadString(\\n): %w", err)
-	}
-
+	lines := strings.Split(string(chunk), "\n")
 	paths := []string{}
-	for {
-		line, err := buf.ReadString('\n')
-		if err != nil {
-			return nil, fmt.Errorf("buf.ReadString(\\n): %w", err)
-		}
+	inDirectoryStructure := false
 
-		if strings.HasPrefix(line, "- ") {
-			paths = append(paths, strings.TrimSpace(line[2:]))
-		} else {
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "<directory_structure>" {
+			inDirectoryStructure = true
+			continue
+		}
+		if trimmed == "</directory_structure>" {
 			break
 		}
+
+		if inDirectoryStructure && strings.HasPrefix(trimmed, "- ") {
+			paths = append(paths, strings.TrimSpace(trimmed[2:]))
+		}
+	}
+
+	if len(paths) == 0 {
+		return nil, ErrNoPathInChunk
 	}
 
 	return paths, nil
+}
+
+var cppExtensions = []string{
+	".cc", ".cpp", ".cxx", ".c++", ".pcc", ".tpp", // c++
+	".hh", ".hpp", ".hxx", ".inl", ".ipp", // c++ header
+	".cppm", ".ixx", ".ccm", ".mpp", ".mxx", ".cxxm", ".hppm", ".hxxm", // c++ module
+	".c", ".ec", ".pgc", // c
+	".h", // c header
+}
+
+func isCppFile(file string) bool {
+	ext := strings.ToLower(filepath.Ext(file))
+
+	return slices.Contains(cppExtensions, ext)
+}
+
+func isJava(file string) bool {
+	ext := strings.ToLower(filepath.Ext(file))
+
+	return ext == ".java"
+}
+
+func isRationalRose(file string) bool {
+	ext := strings.ToLower(filepath.Ext(file))
+
+	return ext == ".cat" || ext == ".mdl"
+}
+
+func isXml(file string) bool {
+	ext := strings.ToLower(filepath.Ext(file))
+
+	return ext == ".xml"
+}
+
+func isMakefile(file string) bool {
+	return strings.ToLower(file) == "makefile"
+}
+
+func isShell(file string) bool {
+	ext := strings.ToLower(filepath.Ext(file))
+
+	return ext == ".sh" || ext == ".csh" || ext == ".ksh" || ext == ".bash"
 }
