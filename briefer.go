@@ -24,40 +24,12 @@ import (
 
 const model = "google/gemini-3-flash-preview"
 
-const cppPrompt = `
-Task: Analyze the following C/C++ component.
-The codebase context (including these files) is loaded in your memory.
-
-Rules for Extraction:
-1. NAME: Extract the exact identifier (e.g., "CMainFrame"). Keep it strictly under 256 characters.
-2. SYNTHESIS: Read the header (.h/.hpp) to identify the entities (classes, structs, functions). Read the implementation (.c/.cpp) to determine the legacy markers (e.g., uses_open_utm, uses_psdb) and dependencies.
-3. CONCISENESS: Provide a structural summary. Do not output raw code blocks.
-
-Files making up this component:
-%s
-`
-
-const lightweightPrompt = `
-Task: Analyze the following build script, configuration, or data file.
-The codebase context is loaded in your memory.
-
-Rules for Extraction:
-1. SUMMARY: Provide a strictly factual, 1-2 sentence explanation of what this file controls, builds, or configures.
-2. KEY ELEMENTS: 
-   - If this is a Makefile or build script, list the primary execution targets (e.g., "all", "clean", "build").
-   - If this is an XML or config file, list the root or most critical configuration nodes/keys.
-3. REFERENCES: List only the exact filenames, modules, or scripts explicitly imported, included, or executed by this file.
-
-Files making up this component:
-%s
-`
-
 type Brief = json.RawMessage
 
 type Chunk struct {
 	content []byte
 	name    string
-	cache   ManagedCache
+	cache   *ManagedCache
 }
 
 type ManagedCache struct {
@@ -65,6 +37,10 @@ type ManagedCache struct {
 	cache       *genai.CachedContent
 	creationMu  sync.Mutex
 }
+
+var (
+	ErrTooMuchRetries = fmt.Errorf("too much retries")
+)
 
 func (mc *ManagedCache) GetOrCreate(ctx context.Context, client *genai.Client, chunk *Chunk) (*genai.CachedContent, error) {
 	if mc.cache != nil {
