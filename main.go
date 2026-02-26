@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/genai"
 )
 
 func main() {
+	if len(os.Args) < 2 {
+		log.Fatalf("Usage: %s <chunker|briefer> [args]", filepath.Base(os.Args[0]))
+	}
+
 	command := os.Args[1]
 
 	ctx := context.Background()
