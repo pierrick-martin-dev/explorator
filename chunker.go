@@ -13,17 +13,11 @@ import (
 type WorkUnit []string
 
 type Chunker struct {
-	extsToKeep map[string]struct{}
 	limitChunk uint
 }
 
-func NewChunker(extsToKeep []string, limitChunk uint) *Chunker {
-	extMap := make(map[string]struct{})
-	for _, ext := range extsToKeep {
-		extMap[strings.ToLower(ext)] = struct{}{}
-	}
+func NewChunker(limitChunk uint) *Chunker {
 	return &Chunker{
-		extsToKeep: extMap,
 		limitChunk: limitChunk,
 	}
 }
@@ -80,12 +74,13 @@ func (c *Chunker) harvestStatTree(path string) (*Node, error) {
 	}
 
 	if !info.IsDir() {
-		ext := strings.ToLower(filepath.Ext(path))
-		if _, ok := c.extsToKeep[ext]; !ok {
-			return nil, nil
+		base := filepath.Base(path)
+		if shouldKeepFile(base) {
+			node.Size = info.Size()
+			return node, nil
 		}
-		node.Size = info.Size()
-		return node, nil
+
+		return nil, nil
 	}
 
 	entries, err := os.ReadDir(path)
@@ -108,6 +103,10 @@ func (c *Chunker) harvestStatTree(path string) (*Node, error) {
 	}
 
 	return node, nil
+}
+
+func shouldKeepFile(base string) bool {
+	return isCppFile(base) || isMakefile(base) || isRationalRose(base) || isXml(base) || isJava(base) || isShell(base)
 }
 
 func (c *Chunker) partitionWork(tree Node) ([]WorkUnit, error) {
@@ -189,8 +188,7 @@ func (c *Chunker) Validate(src string, works []WorkUnit) error {
 		if err != nil || info.IsDir() {
 			return err
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if _, ok := c.extsToKeep[ext]; ok {
+		if shouldKeepFile(filepath.Base(path)) {
 			expectedFiles[path] = true
 		}
 		return nil

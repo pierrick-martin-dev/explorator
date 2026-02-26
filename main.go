@@ -28,17 +28,7 @@ func main() {
 
 		fmt.Printf("Chunking %q into %q with %d limit\n", *srcDir, *outDir, *limit)
 
-		chunker := NewChunker([]string{
-			// from `tokei -l`
-			".cc", ".cpp", ".cxx", ".c++", ".pcc", ".tpp", // c++
-			".hh", ".hpp", ".hxx", ".inl", ".ipp", // c++ header
-			".cppm", ".ixx", ".ccm", ".mpp", ".mxx", ".cxxm", ".hppm", ".hxxm", // c++ module
-			".c", ".ec", ".pgc", // c
-			".h",    // c header
-			".csh",  // c shell
-			".java", // java
-			".cat",  // Rational Rose
-		}, *limit)
+		chunker := NewChunker(*limit)
 		if err := chunker.Chunk(*srcDir, *outDir); err != nil {
 			log.Fatalf("chunker.Run(): %s", err)
 		}
